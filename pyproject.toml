@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pora"
+version = "0.1.0"
+description = "Security audit market CLI, SDK, and MCP server"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "lethe-protocol" }]
+keywords = ["security", "audit", "tee", "oasis", "sapphire"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+dependencies = [
+    "web3>=7.0.0",
+    "cryptography>=41.0.0",
+    "pycryptodome>=3.20.0",
+    "requests>=2.31.0",
+    "click>=8.0.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0.0"]
+dev = ["pytest>=8.0.0", "pytest-mock>=3.14.0"]
+
+[project.scripts]
+pora = "pora.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/lethe-protocol/pora"
+Repository = "https://github.com/lethe-protocol/pora"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pora"]
