@@ -1,7 +1,1 @@
-__pycache__/
-*.egg-info/
-dist/
-build/
-.env
-*.key
-.pytest_cache/
+/target

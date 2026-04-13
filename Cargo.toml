@@ -1,0 +1,34 @@
+[package]
+name = "pora"
+version = "0.1.0"
+edition = "2021"
+description = "Security audit market CLI. The passage where code enters, findings emerge, and vulnerability knowledge is destroyed."
+license = "MIT"
+repository = "https://github.com/lethe-protocol/pora"
+
+[[bin]]
+name = "pora"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json"] }
+
+# Errors
+anyhow = "1"
+
+# Config
+dirs = "6"
+
+# TTY detection
+atty = "0.2"
