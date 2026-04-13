@@ -213,6 +213,49 @@ def audit_show(audit_id, rpc, contract):
     click.echo(f"    Claimed:     {client.w3.from_wei(s['claimed_amount'], 'ether')} ROSE")
 
 
+@audit.command("retrieve")
+@click.argument("audit_id", type=int)
+@click.option("--key", "-k", required=True, help="Path to X25519 private key")
+@click.option("--handle", "-h", default="", help="Delivery handle (e.g., pkt-2-abc123)")
+@click.option("--output", "-o", default="", help="Write report to file instead of stdout")
+@click.option("--auth-token", envvar="PORA_GATEWAY_TOKEN", default="", help="Gateway auth token")
+@click.option("--rpc", envvar="PORA_RPC_URL", default="")
+@click.option("--contract", envvar="PORA_CONTRACT", default="")
+@click.option("--gateway", envvar="PORA_GATEWAY_URL", default="")
+def audit_retrieve(audit_id, key, handle, output, auth_token, rpc, contract, gateway):
+    """Download and decrypt an encrypted audit report.
+
+    AUDIT_ID is the on-chain audit identifier.
+
+    Example:
+        pora audit retrieve 7 --key pora-delivery.key --handle pkt-2-1c5df70af11c
+    """
+    client = _client(rpc_url=rpc, contract_address=contract, gateway_url=gateway)
+
+    try:
+        packet = client.retrieve_audit(
+            audit_id,
+            private_key_path=key,
+            handle=handle,
+            auth_token=auth_token,
+        )
+    except RuntimeError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1)
+
+    report_md = packet.get("reportMarkdown", "")
+    finding_count = packet.get("findingCount", 0)
+    result_type = packet.get("resultType", "unknown")
+
+    if output:
+        with open(output, "w") as f:
+            f.write(report_md)
+        click.echo(f"Report written to {output}")
+        click.echo(f"Result: {result_type}  Findings: {finding_count}")
+    else:
+        click.echo(report_md)
+
+
 # ── Market overview ──
 
 
@@ -233,6 +276,40 @@ def status(rpc, contract):
     click.echo(f"  Audits:    {ac}")
     click.echo(f"  Policy:    {pp.execution_fee_bps//100}% exec / {pp.finding_bonus_bps//100}% finding / {pp.patch_bonus_bps//100}% patch / {pp.regression_bonus_bps//100}% regression")
     click.echo(f"  Standing:  {pp.standing_percent_bps//100}% per audit, min {client.w3.from_wei(pp.minimum_payout, 'ether')} ROSE")
+
+
+# ── MCP server ──
+
+
+@main.command()
+@click.option("--port", "-p", type=int, default=8900, help="Server port")
+@click.option("--host", default="127.0.0.1", help="Bind address (use 0.0.0.0 for remote access)")
+@click.option("--private-key", envvar="PORA_PRIVATE_KEY", default="", help="Wallet private key")
+@click.option("--rpc", envvar="PORA_RPC_URL", default="", help="Sapphire RPC URL")
+@click.option("--contract", envvar="PORA_CONTRACT", default="", help="LetheMarket contract address")
+@click.option("--gateway", envvar="PORA_GATEWAY_URL", default="", help="Delivery gateway URL")
+def mcp(port, host, private_key, rpc, contract, gateway):
+    """Start the pora MCP server for AI agent integration.
+
+    Exposes pora market tools as HTTP endpoints on localhost.
+    Agents can call GET /tools to discover available tools,
+    then POST /tools/<name> with a JSON body to invoke them.
+
+    Example:
+        pora mcp --port 8900
+        curl http://localhost:8900/tools
+        curl -X POST http://localhost:8900/tools/market_status
+    """
+    from pora.mcp_server import start_server
+
+    start_server(
+        host=host,
+        port=port,
+        private_key=private_key,
+        rpc_url=rpc,
+        contract_address=contract,
+        gateway_url=gateway,
+    )
 
 
 if __name__ == "__main__":

@@ -345,6 +345,47 @@ class PoraClient:
             "dispute_status": s[7],
         }
 
+    # ── Encrypted delivery ──
+
+    def retrieve_audit(
+        self, audit_id: int, *, private_key_path: str, handle: str = "", auth_token: str = ""
+    ) -> dict:
+        """Download, verify, and decrypt an encrypted audit report.
+
+        # checks: audit exists, delivery status is Ready (1), private key is valid
+        # effects: downloads ciphertext from gateway, verifies on-chain hashes, decrypts
+        # returns: decrypted report dict with reportMarkdown, findingCount, resultType
+        #
+        # WHY: requesters need a single call to go from audit ID to readable report
+        # SECURITY: private key never leaves this process. Decryption is local.
+        # TRUST: on-chain delivery hashes are the integrity anchor; gateway is semi-trusted
+        """
+        from pora.crypto import download_and_decrypt, load_private_key
+
+        delivery = self.get_delivery(audit_id)
+        if delivery.delivery_status != 1:
+            status_names = {0: "None", 1: "Ready", 2: "Retrieved", 3: "Failed"}
+            raise RuntimeError(
+                f"Delivery not ready for audit #{audit_id}: "
+                f"status={status_names.get(delivery.delivery_status, delivery.delivery_status)}"
+            )
+
+        resolved_handle = handle
+        if not resolved_handle:
+            audit = self.get_audit(audit_id)
+            raise RuntimeError(
+                f"--handle is required (the gateway does not support listing). "
+                f"Look for pkt-{audit.bounty_id}-<random> in the delivery notification."
+            )
+
+        private_key = load_private_key(private_key_path)
+        return download_and_decrypt(
+            resolved_handle,
+            self.gateway_url,
+            private_key,
+            auth_token=auth_token,
+        )
+
     # ── Key management ──
 
     @staticmethod
