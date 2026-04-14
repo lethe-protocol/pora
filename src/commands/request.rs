@@ -35,6 +35,17 @@ pub enum RequestAction {
         /// Period in days for periodic trigger (required if --trigger periodic)
         #[arg(long, default_value = "7")]
         period_days: u64,
+        /// Repo access mode: auto, public, token, app
+        /// auto: detect visibility (public repos skip GitHub App)
+        /// public: no auth needed (public repos only)
+        /// token: use --token PAT for private repo access
+        /// app: use GitHub App installation (existing behavior)
+        #[arg(long, default_value = "auto")]
+        access: String,
+        /// GitHub PAT for private repo access without GitHub App.
+        /// Use '-' to read from stdin.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// List bounties on the market
     List {
@@ -95,14 +106,14 @@ fn parse_tool_mode(mode: &str) -> Result<u8> {
     }
 }
 
-// checks: amount is non-negative
+// checks: amount is greater than zero
 // effects: none
 // returns: amount in wei (1 ROSE = 10^18 wei)
 // WHY: f64 * 1e18 loses precision for fractional amounts (0.1 ROSE → 99999999999999998 wei).
 //      Integer arithmetic avoids this by splitting whole/fractional parts.
 fn rose_to_wei(amount: f64) -> Result<u128> {
-    if amount < 0.0 {
-        anyhow::bail!("Amount must be non-negative");
+    if amount <= 0.0 {
+        anyhow::bail!("Amount must be greater than zero");
     }
     // Format with 18 decimal places to capture full precision
     let s = format!("{:.18}", amount);
@@ -134,6 +145,106 @@ fn parse_repo(repo: &str) -> Result<(&str, &str)> {
 // effects: sends 3-4 transactions on-chain, creates bounty with full config
 // returns: structured JSON with bounty_id and tx hashes
 // SECURITY: transactions are signed locally — private key never leaves the CLI
+// checks: access is one of: auto, public, token, app
+// effects: none
+// returns: validated access mode string
+fn validate_access_mode<'a>(access: &'a str, token: &Option<String>) -> Result<&'a str> {
+    match access {
+        "auto" | "public" | "token" | "app" => {}
+        _ => anyhow::bail!(
+            "Invalid access mode '{}'. Supported: auto, public, token, app",
+            access
+        ),
+    }
+    if access == "token" && token.is_none() {
+        anyhow::bail!("--access token requires --token <PAT>. Use --token ghp_xxx or --token - for stdin.");
+    }
+    Ok(access)
+}
+
+/// Resolve repo access: returns (installation_id, access_mode_label) based on --access flag.
+// checks: access mode is valid, repo exists if auto-detect
+// effects: may query GitHub API for visibility check
+// returns: (installation_id, access_mode_string)
+// WHY: different access modes need different installation IDs.
+//      public=0 (TEE clones without auth), token=0 (TEE uses stored PAT), app=resolved ID.
+async fn resolve_repo_access(
+    owner: &str,
+    repo: &str,
+    access: &str,
+    token: &Option<String>,
+    installation_id: Option<u64>,
+) -> Result<(u64, String)> {
+    match access {
+        "public" => Ok((0, "public".to_string())),
+        "token" => {
+            // WHY: with PAT-based access, the TEE will use the stored token.
+            //      installationId=0 signals "not using GitHub App".
+            Ok((0, "token".to_string()))
+        }
+        "app" => {
+            let id = github::resolve_installation_id(owner, repo, installation_id).await?;
+            Ok((id, "app".to_string()))
+        }
+        "auto" => {
+            // WHY: auto-detect repo visibility. Public repos skip GitHub App entirely.
+            //      unwrap_or(false) treats API failures the same as private repos.
+            let is_public = github::check_repo_visibility(owner, repo).await.unwrap_or(false);
+            if is_public {
+                Ok((0, "public".to_string()))
+            } else if token.is_some() {
+                Ok((0, "token".to_string()))
+            } else {
+                let id = github::resolve_installation_id(owner, repo, installation_id).await?;
+                Ok((id, "app".to_string()))
+            }
+        }
+        _ => unreachable!(), // validated above
+    }
+}
+
+/// Read a token from the --token flag value, supporting '-' for stdin.
+// checks: token is non-empty
+// effects: may read from stdin
+// returns: token string
+fn read_token(token_value: &str) -> Result<String> {
+    if token_value == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        let trimmed = buf.trim().to_string();
+        anyhow::ensure!(!trimmed.is_empty(), "Empty token from stdin");
+        Ok(trimmed)
+    } else {
+        Ok(token_value.to_string())
+    }
+}
+
+/// Save a repo access token (base64-encoded) to ~/.pora/tokens/{bounty_id}.token.
+// checks: token is non-empty
+// effects: creates ~/.pora/tokens/ if needed, writes base64-encoded token file with 0600 permissions
+// SECURITY: token is NOT encrypted — protected by file permissions only (0600 on Unix).
+//           This is a local convenience store for testnet. Production will use Sapphire's
+//           confidential storage for on-chain token storage.
+fn save_repo_token(bounty_id: u64, token: &str) -> Result<()> {
+    let dir = config::config_dir().join("tokens");
+    std::fs::create_dir_all(&dir)?;
+    // WHY: for now, store the token as base64-encoded plaintext in a restricted file.
+    //      Full encryption with the delivery X25519 key requires contract-side changes.
+    //      File permissions (0600) provide local protection.
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, token.as_bytes());
+    let path = dir.join(format!("{}.token", bounty_id));
+    std::fs::write(&path, &encoded)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(())
+}
+
 async fn execute_submit(
     repo: &str,
     amount: f64,
@@ -143,18 +254,34 @@ async fn execute_submit(
     standing: bool,
     installation_id: Option<u64>,
     period_days: u64,
+    access: &str,
+    token: &Option<String>,
     format: &Format,
 ) -> Result<()> {
+    // WHY: fail fast on missing wallet before reaching GitHub or RPC calls.
+    //      Users without a wallet should get clear guidance, not GitHub 401.
+    let _private_key = crate::config::get_private_key()
+        .context("Wallet required for submit. Set PORA_PRIVATE_KEY or add private_key to ~/.pora/config.toml")?;
+
+    let amount_wei = rose_to_wei(amount)?;
     let (owner, repo_name) = parse_repo(repo)?;
     let trigger_mode = parse_trigger_mode(trigger)?;
     let tool_mode = parse_tool_mode(mode)?;
+    let access = validate_access_mode(access, token)?;
 
-    // Resolve GitHub installation ID (AD-4: 5-level fallback)
-    let install_id =
-        github::resolve_installation_id(owner, repo_name, installation_id).await?;
+    // Resolve repo access (may skip GitHub App for public/token modes)
+    let (install_id, access_label) = resolve_repo_access(
+        owner, repo_name, access, token, installation_id,
+    ).await?;
+
+    // Read token from value (supports '-' for stdin)
+    let resolved_token = if let Some(t) = token {
+        Some(read_token(t)?)
+    } else {
+        None
+    };
 
     let cfg = config::load_config();
-    let amount_wei = rose_to_wei(amount)?;
     let duration_secs = duration_hours * 3600;
 
     let repo_hash = abi::repo_hash(owner, repo_name);
@@ -243,10 +370,20 @@ async fn execute_submit(
         }
     }
 
+    // Save token locally if provided
+    if let Some(ref tok) = resolved_token {
+        if let Err(e) = save_repo_token(bounty_id, tok) {
+            // WHY: token save failure is non-fatal — the bounty is already created.
+            //      Warn but don't fail the entire submit flow.
+            eprintln!("Warning: could not save token locally: {}", e);
+        }
+    }
+
     // All 4 transactions succeeded
     let result = serde_json::json!({
         "bounty_id": bounty_id,
         "repo": format!("{}/{}", owner, repo_name),
+        "access_mode": access_label,
         "installation_id": install_id,
         "amount": format!("{} ROSE", amount),
         "amount_wei": amount_wei.to_string(),
@@ -320,6 +457,7 @@ fn report_partial_failure(
 /// Stream audit events for a bounty as NDJSON.
 // checks: bounty_id is valid, RPC reachable
 // effects: polls eth_getLogs, emits NDJSON to stdout
+// returns: Ok(()) on success; Err if --once and zero events found across all fetches
 async fn execute_watch(bounty_id: u64, interval: u64, once: bool) -> Result<()> {
     let cfg = config::load_config();
     let rpc = crate::rpc::RpcClient::new(&cfg.rpc_url);
@@ -332,26 +470,26 @@ async fn execute_watch(bounty_id: u64, interval: u64, once: bool) -> Result<()> 
     let mut from_block = if once { current.saturating_sub(ONCE_LOOKBACK) } else { current };
     let sleep_dur = tokio::time::Duration::from_secs(interval);
 
+    // WHY: track total events only for --once exit-code check; continuous mode never bails on zero.
+    let mut total_events: usize = 0;
+
     loop {
         let to_block = rpc.eth_block_number().await.unwrap_or(from_block);
 
         if to_block >= from_block {
-            let from_hex = format!("0x{:x}", from_block);
-            let to_hex = format!("0x{:x}", to_block);
-
             // Events indexed by bountyId in topic[1]
             for (topic0, event_name) in abi::bounty_event_topics() {
-                rpc.fetch_and_emit_logs(
+                total_events += rpc.fetch_and_emit_logs(
                     &cfg.contract, &[Some(topic0), Some(&bounty_id_hex)],
-                    &from_hex, &to_hex, event_name,
+                    from_block, to_block, event_name,
                 ).await;
             }
 
             // Events indexed by bountyId in topic[2]
             for (topic0, event_name) in abi::audit_event_topics_by_bounty() {
-                rpc.fetch_and_emit_logs(
+                total_events += rpc.fetch_and_emit_logs(
                     &cfg.contract, &[Some(topic0), None, Some(&bounty_id_hex)],
-                    &from_hex, &to_hex, event_name,
+                    from_block, to_block, event_name,
                 ).await;
             }
 
@@ -360,16 +498,27 @@ async fn execute_watch(bounty_id: u64, interval: u64, once: bool) -> Result<()> 
                 (abi::audit_payout_claimed_topic(), "payout.claimed"),
                 (abi::audit_delivery_recorded_topic(), "audit.delivery_recorded"),
             ] {
-                rpc.fetch_and_emit_logs(
+                total_events += rpc.fetch_and_emit_logs(
                     &cfg.contract, &[Some(topic0)],
-                    &from_hex, &to_hex, event_name,
+                    from_block, to_block, event_name,
                 ).await;
             }
 
             from_block = to_block + 1;
         }
 
-        if once { return Ok(()); }
+        if once {
+            // WHY: exit non-zero so scripts consuming NDJSON can detect all-fail scenarios.
+            //      Zero events means either no history in the lookback window or all RPC calls failed.
+            if total_events == 0 {
+                anyhow::bail!(
+                    "No events found for bounty #{} in the last {} blocks",
+                    bounty_id,
+                    ONCE_LOOKBACK
+                );
+            }
+            return Ok(());
+        }
 
         tokio::select! {
             _ = tokio::time::sleep(sleep_dur) => {},
@@ -465,6 +614,58 @@ async fn execute_results(audit_id: u64, key: Option<String>, raw: bool, format: 
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rose_to_wei_zero_rejected() {
+        assert!(rose_to_wei(0.0).is_err());
+    }
+
+    #[test]
+    fn test_rose_to_wei_positive() {
+        assert_eq!(rose_to_wei(1.0).unwrap(), 1_000_000_000_000_000_000u128);
+    }
+
+    #[test]
+    fn test_rose_to_wei_fractional() {
+        // WHY: f64 cannot represent 0.1 exactly; format!("{:.18}", 0.1) yields
+        //      "0.100000000000000005551..." which rounds the last digit up.
+        //      We test the actual output of the integer-split algorithm, not an
+        //      idealized value, so callers know what precision to expect.
+        let wei = rose_to_wei(0.1).unwrap();
+        assert!(
+            wei >= 99_999_999_999_999_990 && wei <= 100_000_000_000_000_010,
+            "0.1 ROSE should be within 10 wei of 0.1 * 10^18, got {}",
+            wei
+        );
+    }
+
+    #[test]
+    fn test_validate_access_mode_valid() {
+        for mode in ["auto", "public", "token", "app"] {
+            let token = if mode == "token" { Some("ghp_xxx".to_string()) } else { None };
+            assert!(validate_access_mode(mode, &token).is_ok(), "mode '{}' should be valid", mode);
+        }
+    }
+
+    #[test]
+    fn test_validate_access_mode_invalid() {
+        assert!(validate_access_mode("invalid", &None).is_err());
+    }
+
+    #[test]
+    fn test_validate_access_mode_token_requires_token() {
+        assert!(validate_access_mode("token", &None).is_err());
+    }
+
+    #[test]
+    fn test_rose_to_wei_negative_rejected() {
+        assert!(rose_to_wei(-1.0).is_err());
+    }
+}
+
 pub async fn run(action: RequestAction, format: &Format) -> Result<()> {
     match action {
         RequestAction::Submit {
@@ -476,6 +677,8 @@ pub async fn run(action: RequestAction, format: &Format) -> Result<()> {
             standing,
             installation_id,
             period_days,
+            access,
+            token,
         } => {
             execute_submit(
                 &repo,
@@ -486,6 +689,8 @@ pub async fn run(action: RequestAction, format: &Format) -> Result<()> {
                 standing,
                 installation_id,
                 period_days,
+                &access,
+                &token,
                 format,
             )
             .await?;

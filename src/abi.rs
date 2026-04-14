@@ -310,7 +310,7 @@ pub fn encode_get_delivery_config(bounty_id: u64) -> String {
 pub fn encode_get_performer(address: &str) -> String {
     let sel = &keccak256(b"getPerformer(address)")[..4];
     let addr_clean = address.trim_start_matches("0x").to_lowercase();
-    format!("0x{}{:>064}", hex::encode(sel), addr_clean)
+    format!("0x{}{:0>64}", hex::encode(sel), addr_clean)
 }
 
 // --- View Call Decoding ---
@@ -445,5 +445,19 @@ mod tests {
         assert_eq!(data.len(), 4 + 4 * 32);
         // delivery_mode = 1 (RequesterOnly) in last slot
         assert_eq!(data[4 + 3 * 32 + 31], 1);
+    }
+
+    #[test]
+    fn test_encode_get_performer_padding() {
+        let encoded = encode_get_performer("0x1234567890abcdef1234567890abcdef12345678");
+        // Should contain no spaces
+        assert!(!encoded.contains(' '), "encoded calldata contains space characters");
+        // Should be valid hex (0x prefix + hex chars only)
+        let without_prefix = encoded.trim_start_matches("0x");
+        assert!(without_prefix.chars().all(|c| c.is_ascii_hexdigit()),
+            "encoded calldata contains non-hex characters: {}", encoded);
+        // Length: 0x + 8 (selector) + 64 (address) = 74 chars
+        assert_eq!(without_prefix.len(), 8 + 64,
+            "unexpected calldata length: {}", without_prefix.len());
     }
 }

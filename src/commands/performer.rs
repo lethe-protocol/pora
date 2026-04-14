@@ -75,18 +75,18 @@ async fn execute_start(interval: u64, once: bool) -> Result<()> {
     let sleep_dur = tokio::time::Duration::from_secs(interval);
     let mut heartbeat_counter = 0u64;
 
+    // WHY: track total events only for --once exit-code check; continuous mode never bails on zero.
+    let mut total_events: usize = 0;
+
     loop {
         let current_block = rpc.eth_block_number().await.unwrap_or(from_block);
 
         if current_block >= from_block {
-            let from_hex = format!("0x{:x}", from_block);
-            let to_hex = format!("0x{:x}", current_block);
-
             // AuditPayoutClaimed — performer is topic[2], filter directly
-            rpc.fetch_and_emit_logs(
+            total_events += rpc.fetch_and_emit_logs(
                 &cfg.contract,
                 &[Some(abi::audit_payout_claimed_topic()), None, Some(&performer_topic)],
-                &from_hex, &to_hex, "payout.claimed",
+                from_block, current_block, "payout.claimed",
             ).await;
 
             // Events without performer index — emit all, client correlates
@@ -95,9 +95,9 @@ async fn execute_start(interval: u64, once: bool) -> Result<()> {
                 (abi::audit_result_submitted_topic(), "audit.result_submitted"),
                 (abi::audit_delivery_recorded_topic(), "audit.delivery_recorded"),
             ] {
-                rpc.fetch_and_emit_logs(
+                total_events += rpc.fetch_and_emit_logs(
                     &cfg.contract, &[Some(topic0)],
-                    &from_hex, &to_hex, event_name,
+                    from_block, current_block, event_name,
                 ).await;
             }
 
@@ -112,7 +112,18 @@ async fn execute_start(interval: u64, once: bool) -> Result<()> {
             "tick": heartbeat_counter,
         }));
 
-        if once { return Ok(()); }
+        if once {
+            // WHY: exit non-zero so scripts consuming NDJSON can detect all-fail scenarios.
+            //      Zero events means no activity in the lookback window or all RPC calls failed.
+            if total_events == 0 {
+                anyhow::bail!(
+                    "No events found for performer {} in the last {} blocks",
+                    performer_address,
+                    ONCE_LOOKBACK
+                );
+            }
+            return Ok(());
+        }
 
         tokio::select! {
             _ = tokio::time::sleep(sleep_dur) => {},
@@ -128,13 +139,48 @@ fn load_performer_address() -> Option<String> {
     val["address"].as_str().map(|s| s.to_string())
 }
 
+/// Save performer configuration to ~/.pora/performer.json.
+// checks: config_dir is writable
+// effects: creates ~/.pora/ if needed, writes performer.json
+// returns: Ok on success
+fn save_performer_config(address: Option<&str>, provider: &str, api_key_source: &str) -> Result<()> {
+    let dir = config::config_dir();
+    std::fs::create_dir_all(&dir)?;
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cfg = serde_json::json!({
+        "address": address.unwrap_or(""),
+        "provider": provider,
+        "api_key_source": api_key_source,
+        "created_at": created_at,
+    });
+    std::fs::write(
+        dir.join("performer.json"),
+        serde_json::to_string_pretty(&cfg)?,
+    )?;
+    Ok(())
+}
+
 pub async fn run(action: PerformerAction, format: &Format) -> Result<()> {
     match action {
         PerformerAction::Init { provider, use_claude_login } => {
-            let mut api_key_source = "manual".to_string();
+            // Validate provider
+            // WHY: reject unknown providers early so the user gets a clear error instead of a
+            //      silent no-op or a misleading "config saved" message.
+            let valid_providers = ["anthropic", "openai", "openrouter"];
+            if !valid_providers.contains(&provider.as_str()) {
+                anyhow::bail!(
+                    "Unsupported provider '{}'. Supported: {}",
+                    provider,
+                    valid_providers.join(", ")
+                );
+            }
 
             if use_claude_login {
                 // Auto-detect Claude Code OAuth token
+                // SECURITY: token bytes are never echoed in output — only subscription metadata.
                 if let Some(home) = dirs::home_dir() {
                     let creds_path = home.join(".claude").join(".credentials.json");
                     if creds_path.exists() {
@@ -142,18 +188,21 @@ pub async fn run(action: PerformerAction, format: &Format) -> Result<()> {
                             &std::fs::read_to_string(&creds_path)?
                         )?;
                         if let Some(oauth) = creds.get("claudeAiOauth") {
-                            if let Some(token) = oauth.get("accessToken").and_then(|t| t.as_str()) {
+                            // WHY: we only check that the token field exists; we do not read its
+                            //      value into a variable that could leak into output or logs.
+                            if oauth.get("accessToken").and_then(|t| t.as_str()).is_some() {
                                 let sub_type = oauth.get("subscriptionType")
                                     .and_then(|s| s.as_str())
                                     .unwrap_or("unknown");
-                                api_key_source = format!("claude-oauth ({})", sub_type);
+                                let api_key_source = format!("claude-oauth ({})", sub_type);
+
+                                save_performer_config(None, &provider, &api_key_source)?;
 
                                 let info = serde_json::json!({
                                     "provider": provider,
                                     "api_key_source": api_key_source,
-                                    "token_prefix": &token[..20],
                                     "subscription": sub_type,
-                                    "message": "Claude Code OAuth token detected. No additional API costs."
+                                    "message": "Claude Code OAuth token detected. Config saved to ~/.pora/performer.json. No additional API costs."
                                 });
                                 output::print_success(format, "performer.init", &info);
                                 return Ok(());
@@ -164,13 +213,34 @@ pub async fn run(action: PerformerAction, format: &Format) -> Result<()> {
                 anyhow::bail!("Claude Code credentials not found at ~/.claude/.credentials.json. Run 'claude' and log in first.");
             }
 
-            let info = serde_json::json!({
-                "provider": provider,
-                "api_key_source": api_key_source,
-                "status": "not_implemented",
-                "message": "Set ANTHROPIC_API_KEY or use --use-claude-login"
-            });
-            output::print_success(format, "performer.init", &info);
+            // Non-claude-login path: check for provider-specific API key
+            // checks: provider is already validated above
+            // effects: writes ~/.pora/performer.json on success
+            // returns: error with provider-specific hint if no key is found
+            let env_var = match provider.as_str() {
+                "anthropic" => "ANTHROPIC_API_KEY",
+                "openai" => "OPENAI_API_KEY",
+                "openrouter" => "OPENROUTER_API_KEY",
+                _ => unreachable!(), // validated above
+            };
+
+            if std::env::var(env_var).is_ok() {
+                let api_key_source = format!("env:{}", env_var);
+                save_performer_config(None, &provider, &api_key_source)?;
+                let info = serde_json::json!({
+                    "provider": provider,
+                    "api_key_source": api_key_source,
+                    "message": format!("{} detected. Config saved to ~/.pora/performer.json", env_var),
+                });
+                output::print_success(format, "performer.init", &info);
+            } else {
+                let hint = if provider == "anthropic" {
+                    format!("Set {} or use --use-claude-login", env_var)
+                } else {
+                    format!("Set {} environment variable", env_var)
+                };
+                anyhow::bail!("No API key found for provider '{}'. {}", provider, hint);
+            }
         }
         PerformerAction::Start { interval, once } => {
             execute_start(interval, once).await?;

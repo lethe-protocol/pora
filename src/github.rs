@@ -97,6 +97,37 @@ async fn github_api_lookup(owner: &str, repo: &str) -> Result<u64> {
         .context("GitHub API response missing 'id' field")
 }
 
+/// Check if a GitHub repo is public by making an unauthenticated API call.
+// checks: GitHub API is reachable
+// effects: HTTP GET to GitHub API (no auth required for public repos)
+// returns: true if public, false if private/not found
+// WHY: public repos don't need any auth for TEE to clone.
+//      This enables the --access auto mode to skip GitHub App for open source repos.
+pub async fn check_repo_visibility(owner: &str, repo: &str) -> Result<bool> {
+    let client = reqwest::Client::new();
+    let url = format!("https://api.github.com/repos/{}/{}", owner, repo);
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "pora-cli")
+        .send()
+        .await
+        .context("GitHub API request failed")?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        // 404 means either private or non-existent. Cannot distinguish without auth.
+        return Ok(false);
+    }
+
+    if !resp.status().is_success() {
+        anyhow::bail!("GitHub API returned {}", resp.status());
+    }
+
+    let json: serde_json::Value = resp.json().await?;
+    // WHY: GitHub API returns {"private": false} for public repos.
+    Ok(!json["private"].as_bool().unwrap_or(true))
+}
+
 /// Resolve GitHub App installation ID using the 5-level fallback (AD-4).
 ///
 /// Priority:
