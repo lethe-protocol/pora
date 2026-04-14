@@ -184,7 +184,7 @@ fn save_performer_config(address: Option<&str>, provider: &str, api_key_source: 
 // checks: performer address available (from PORA_PRIVATE_KEY or performer.json)
 // effects: read-only RPC calls (eth_call + eth_getLogs)
 // returns: structured JSON with registration, earnings, reputation
-async fn execute_status(format: &Format) -> Result<()> {
+pub async fn execute_status() -> Result<serde_json::Value> {
     let cfg = config::load_config();
     let rpc = crate::rpc::RpcClient::new(&cfg.rpc_url);
 
@@ -259,7 +259,7 @@ async fn execute_status(format: &Format) -> Result<()> {
     // WHY: show both wei (exact) and ROSE (human-readable) for convenience
     let claimed_rose = claimed_wei as f64 / 1e18;
 
-    let result = serde_json::json!({
+    Ok(serde_json::json!({
         "address": performer_address,
         "registered": registered,
         "earnings": {
@@ -268,9 +268,7 @@ async fn execute_status(format: &Format) -> Result<()> {
         },
         "reputation": reputation,
         "note": "Active claims not available in v1",
-    });
-    output::print_success(format, "performer.status", &result);
-    Ok(())
+    }))
 }
 
 /// Claim audit payout for a completed audit.
@@ -279,7 +277,7 @@ async fn execute_status(format: &Format) -> Result<()> {
 // returns: structured JSON with tx hash
 // WHY: claimAuditPayout requires either disputeStatus==ResolvedPerformer
 //      or (disputeStatus==None && block.timestamp >= lockedUntil).
-async fn execute_claim_payout(audit_id: u64, format: &Format) -> Result<()> {
+pub async fn execute_claim_payout(audit_id: u64) -> Result<serde_json::Value> {
     let _key = crate::config::get_private_key()
         .context("Wallet required for claim-payout. Set PORA_PRIVATE_KEY")?;
     let cfg = crate::config::load_config();
@@ -287,18 +285,17 @@ async fn execute_claim_payout(audit_id: u64, format: &Format) -> Result<()> {
     let (tx_hash, _receipt) = crate::tx::send_and_confirm(&cfg.contract, 0, data, 200_000)
         .await
         .context("claimAuditPayout transaction failed (payout may be locked or already claimed)")?;
-    output::print_success(format, "performer.claim_payout", &serde_json::json!({
+    Ok(serde_json::json!({
         "audit_id": audit_id,
         "tx": tx_hash,
-    }));
-    Ok(())
+    }))
 }
 
 /// Release a bounty claim.
 // checks: private key configured
 // effects: sends releaseBountyClaim tx on-chain
 // returns: structured JSON with tx hash
-async fn execute_release_claim(bounty_id: u64, format: &Format) -> Result<()> {
+pub async fn execute_release_claim(bounty_id: u64) -> Result<serde_json::Value> {
     let _key = crate::config::get_private_key()
         .context("Wallet required for release-claim. Set PORA_PRIVATE_KEY")?;
     let cfg = crate::config::load_config();
@@ -306,103 +303,157 @@ async fn execute_release_claim(bounty_id: u64, format: &Format) -> Result<()> {
     let (tx_hash, _receipt) = crate::tx::send_and_confirm(&cfg.contract, 0, data, 200_000)
         .await
         .context("releaseBountyClaim transaction failed")?;
-    crate::output::print_success(format, "performer.release_claim", &serde_json::json!({
+    Ok(serde_json::json!({
         "bounty_id": bounty_id,
         "tx": tx_hash,
-    }));
-    Ok(())
+    }))
+}
+
+/// Initialize performer config.
+// checks: provider is valid, API key or Claude OAuth available
+// effects: writes ~/.pora/performer.json
+// returns: structured JSON with config details
+pub fn execute_init(provider: &str, use_claude_login: bool) -> Result<serde_json::Value> {
+    let valid_providers = ["anthropic", "openai", "openrouter"];
+    if !valid_providers.contains(&provider) {
+        anyhow::bail!(
+            "Unsupported provider '{}'. Supported: {}",
+            provider,
+            valid_providers.join(", ")
+        );
+    }
+
+    if use_claude_login {
+        // SECURITY: token bytes are never echoed in output — only subscription metadata.
+        if let Some(home) = dirs::home_dir() {
+            let creds_path = home.join(".claude").join(".credentials.json");
+            if creds_path.exists() {
+                let creds: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(&creds_path)?
+                )?;
+                if let Some(oauth) = creds.get("claudeAiOauth") {
+                    if oauth.get("accessToken").and_then(|t| t.as_str()).is_some() {
+                        let sub_type = oauth.get("subscriptionType")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("unknown");
+                        let api_key_source = format!("claude-oauth ({})", sub_type);
+
+                        save_performer_config(None, provider, &api_key_source)?;
+
+                        return Ok(serde_json::json!({
+                            "provider": provider,
+                            "api_key_source": api_key_source,
+                            "subscription": sub_type,
+                            "message": "Claude Code OAuth token detected. Config saved to ~/.pora/performer.json. No additional API costs."
+                        }));
+                    }
+                }
+            }
+        }
+        anyhow::bail!("Claude Code credentials not found at ~/.claude/.credentials.json. Run 'claude' and log in first.");
+    }
+
+    let env_var = match provider {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        _ => unreachable!(),
+    };
+
+    if std::env::var(env_var).is_ok() {
+        let api_key_source = format!("env:{}", env_var);
+        save_performer_config(None, provider, &api_key_source)?;
+        Ok(serde_json::json!({
+            "provider": provider,
+            "api_key_source": api_key_source,
+            "message": format!("{} detected. Config saved to ~/.pora/performer.json", env_var),
+        }))
+    } else {
+        let hint = if provider == "anthropic" {
+            format!("Set {} or use --use-claude-login", env_var)
+        } else {
+            format!("Set {} environment variable", env_var)
+        };
+        anyhow::bail!("No API key found for provider '{}'. {}", provider, hint);
+    }
+}
+
+/// Snapshot of performer events (MCP-friendly version of start --once).
+// checks: performer address available
+// effects: read-only RPC calls
+// returns: collected events as JSON
+pub async fn execute_monitor() -> Result<serde_json::Value> {
+    let cfg = config::load_config();
+    let rpc = crate::rpc::RpcClient::new(&cfg.rpc_url);
+    let performer_address = resolve_performer_address()?;
+
+    let addr_clean = performer_address.trim_start_matches("0x").to_lowercase();
+    let performer_topic = format!("0x000000000000000000000000{}", addr_clean);
+
+    const LOOKBACK: u64 = 50_000;
+    let current = rpc.eth_block_number().await?;
+    let from_block = current.saturating_sub(LOOKBACK);
+
+    let mut events: Vec<serde_json::Value> = Vec::new();
+
+    // AuditPayoutClaimed — performer is topic[2]
+    if let Ok(logs) = rpc.eth_get_logs_chunked(
+        &cfg.contract,
+        &[Some(abi::audit_payout_claimed_topic()), None, Some(&performer_topic)],
+        from_block, current,
+    ).await {
+        for log in logs {
+            events.push(json!({"event": "payout.claimed", "log": log}));
+        }
+    }
+
+    // Events without performer index
+    for (topic0, event_name) in [
+        (abi::audit_submitted_topic(), "audit.submitted"),
+        (abi::audit_result_submitted_topic(), "audit.result_submitted"),
+        (abi::audit_delivery_recorded_topic(), "audit.delivery_recorded"),
+    ] {
+        if let Ok(logs) = rpc.eth_get_logs_chunked(
+            &cfg.contract, &[Some(topic0)],
+            from_block, current,
+        ).await {
+            for log in logs {
+                events.push(json!({"event": event_name, "log": log}));
+            }
+        }
+    }
+
+    let count = events.len();
+    Ok(json!({
+        "performer": performer_address,
+        "events": events,
+        "count": count,
+        "from_block": from_block,
+        "to_block": current,
+    }))
 }
 
 pub async fn run(action: PerformerAction, format: &Format) -> Result<()> {
     match action {
         PerformerAction::Init { provider, use_claude_login } => {
-            // Validate provider
-            // WHY: reject unknown providers early so the user gets a clear error instead of a
-            //      silent no-op or a misleading "config saved" message.
-            let valid_providers = ["anthropic", "openai", "openrouter"];
-            if !valid_providers.contains(&provider.as_str()) {
-                anyhow::bail!(
-                    "Unsupported provider '{}'. Supported: {}",
-                    provider,
-                    valid_providers.join(", ")
-                );
-            }
-
-            if use_claude_login {
-                // Auto-detect Claude Code OAuth token
-                // SECURITY: token bytes are never echoed in output — only subscription metadata.
-                if let Some(home) = dirs::home_dir() {
-                    let creds_path = home.join(".claude").join(".credentials.json");
-                    if creds_path.exists() {
-                        let creds: serde_json::Value = serde_json::from_str(
-                            &std::fs::read_to_string(&creds_path)?
-                        )?;
-                        if let Some(oauth) = creds.get("claudeAiOauth") {
-                            // WHY: we only check that the token field exists; we do not read its
-                            //      value into a variable that could leak into output or logs.
-                            if oauth.get("accessToken").and_then(|t| t.as_str()).is_some() {
-                                let sub_type = oauth.get("subscriptionType")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or("unknown");
-                                let api_key_source = format!("claude-oauth ({})", sub_type);
-
-                                save_performer_config(None, &provider, &api_key_source)?;
-
-                                let info = serde_json::json!({
-                                    "provider": provider,
-                                    "api_key_source": api_key_source,
-                                    "subscription": sub_type,
-                                    "message": "Claude Code OAuth token detected. Config saved to ~/.pora/performer.json. No additional API costs."
-                                });
-                                output::print_success(format, "performer.init", &info);
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-                anyhow::bail!("Claude Code credentials not found at ~/.claude/.credentials.json. Run 'claude' and log in first.");
-            }
-
-            // Non-claude-login path: check for provider-specific API key
-            // checks: provider is already validated above
-            // effects: writes ~/.pora/performer.json on success
-            // returns: error with provider-specific hint if no key is found
-            let env_var = match provider.as_str() {
-                "anthropic" => "ANTHROPIC_API_KEY",
-                "openai" => "OPENAI_API_KEY",
-                "openrouter" => "OPENROUTER_API_KEY",
-                _ => unreachable!(), // validated above
-            };
-
-            if std::env::var(env_var).is_ok() {
-                let api_key_source = format!("env:{}", env_var);
-                save_performer_config(None, &provider, &api_key_source)?;
-                let info = serde_json::json!({
-                    "provider": provider,
-                    "api_key_source": api_key_source,
-                    "message": format!("{} detected. Config saved to ~/.pora/performer.json", env_var),
-                });
-                output::print_success(format, "performer.init", &info);
-            } else {
-                let hint = if provider == "anthropic" {
-                    format!("Set {} or use --use-claude-login", env_var)
-                } else {
-                    format!("Set {} environment variable", env_var)
-                };
-                anyhow::bail!("No API key found for provider '{}'. {}", provider, hint);
-            }
+            let data = execute_init(&provider, use_claude_login)?;
+            output::print_success(format, "performer.init", &data);
         }
         PerformerAction::Start { interval, once } => {
+            // WHY: streaming command outputs directly to stdout as NDJSON
             execute_start(interval, once).await?;
         }
         PerformerAction::Status => {
-            execute_status(format).await?;
+            let data = execute_status().await?;
+            output::print_success(format, "performer.status", &data);
         }
         PerformerAction::ClaimPayout { audit_id } => {
-            execute_claim_payout(audit_id, format).await?;
+            let data = execute_claim_payout(audit_id).await?;
+            output::print_success(format, "performer.claim_payout", &data);
         }
         PerformerAction::ReleaseClaim { bounty_id } => {
-            execute_release_claim(bounty_id, format).await?;
+            let data = execute_release_claim(bounty_id).await?;
+            output::print_success(format, "performer.release_claim", &data);
         }
     }
     Ok(())

@@ -6,6 +6,7 @@ mod config;
 mod contract;
 mod crypto;
 mod github;
+mod mcp;
 mod output;
 mod rpc;
 mod tx;
@@ -40,6 +41,8 @@ enum Commands {
         #[command(subcommand)]
         action: commands::system::SystemAction,
     },
+    /// Start MCP (Model Context Protocol) server for AI agent integration
+    Mcp,
 }
 
 #[tokio::main]
@@ -62,6 +65,7 @@ async fn main() {
         Commands::Request { action } => commands::request::run(action, &format).await,
         Commands::Performer { action } => commands::performer::run(action, &format).await,
         Commands::System { action } => commands::system::run(action, &format).await,
+        Commands::Mcp => mcp::run_server().await,
     };
 
     if let Err(e) = result {

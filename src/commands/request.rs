@@ -263,7 +263,7 @@ fn save_repo_token(bounty_id: u64, token: &str) -> Result<()> {
     Ok(())
 }
 
-async fn execute_submit(
+pub async fn execute_submit(
     repo: &str,
     amount: f64,
     trigger: &str,
@@ -274,8 +274,7 @@ async fn execute_submit(
     period_days: u64,
     access: &str,
     token: &Option<String>,
-    format: &Format,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
     // WHY: fail fast on missing wallet before reaching GitHub or RPC calls.
     //      Users without a wallet should get clear guidance, not GitHub 401.
     let _private_key = crate::config::get_private_key()
@@ -407,7 +406,7 @@ async fn execute_submit(
     }
 
     // All 4 transactions succeeded
-    let result = serde_json::json!({
+    Ok(serde_json::json!({
         "bounty_id": bounty_id,
         "repo": format!("{}/{}", owner, repo_name),
         "access_mode": access_label,
@@ -420,9 +419,7 @@ async fn execute_submit(
         "duration_hours": duration_hours,
         "delivery": "encrypted",
         "transactions": tx_hashes,
-    });
-    output::print_success(format, "request.submit", &result);
-    Ok(())
+    }))
 }
 
 // checks: receipt has logs with BountyCreated event
@@ -464,12 +461,12 @@ fn extract_bounty_id_from_receipt(receipt: &tx::TxReceipt) -> Result<u64> {
 // checks: none
 // effects: none
 // returns: Err with structured partial failure context
-fn report_partial_failure(
+fn report_partial_failure<T>(
     failed_step: &str,
     bounty_id: u64,
     successful_txs: &[String],
     error: anyhow::Error,
-) -> Result<()> {
+) -> Result<T> {
     anyhow::bail!(
         "PARTIAL_SUBMIT_FAILURE: {} failed after bounty #{} was created. \
          Successful txs: [{}]. Error: {}. \
@@ -485,7 +482,7 @@ fn report_partial_failure(
 // checks: private key configured, bounty_id > 0
 // effects: sends cancelBounty tx on-chain
 // returns: structured JSON with tx hash
-async fn execute_cancel(bounty_id: u64, format: &Format) -> Result<()> {
+pub async fn execute_cancel(bounty_id: u64) -> Result<serde_json::Value> {
     let _key = crate::config::get_private_key()
         .context("Wallet required for cancel. Set PORA_PRIVATE_KEY")?;
     let cfg = config::load_config();
@@ -493,11 +490,10 @@ async fn execute_cancel(bounty_id: u64, format: &Format) -> Result<()> {
     let (tx_hash, _receipt) = tx::send_and_confirm(&cfg.contract, 0, data, 200_000)
         .await
         .context("cancelBounty transaction failed")?;
-    output::print_success(format, "request.cancel", &serde_json::json!({
+    Ok(serde_json::json!({
         "bounty_id": bounty_id,
         "tx": tx_hash,
-    }));
-    Ok(())
+    }))
 }
 
 /// Top up a standing bounty's pool.
@@ -505,7 +501,7 @@ async fn execute_cancel(bounty_id: u64, format: &Format) -> Result<()> {
 // effects: sends topUpBounty tx on-chain with ROSE value
 // returns: structured JSON with tx hash and amount
 // WHY: topUpBounty(uint256) requires bounty.standing — non-standing bounties will revert.
-async fn execute_topup(bounty_id: u64, amount: f64, format: &Format) -> Result<()> {
+pub async fn execute_topup(bounty_id: u64, amount: f64) -> Result<serde_json::Value> {
     let _key = crate::config::get_private_key()
         .context("Wallet required for topup. Set PORA_PRIVATE_KEY")?;
     let amount_wei = rose_to_wei(amount)?;
@@ -514,20 +510,19 @@ async fn execute_topup(bounty_id: u64, amount: f64, format: &Format) -> Result<(
     let (tx_hash, _receipt) = tx::send_and_confirm(&cfg.contract, amount_wei, data, 200_000)
         .await
         .context("topUpBounty transaction failed (is this a standing bounty?)")?;
-    output::print_success(format, "request.topup", &serde_json::json!({
+    Ok(serde_json::json!({
         "bounty_id": bounty_id,
         "amount": format!("{} ROSE", amount),
         "amount_wei": amount_wei.to_string(),
         "tx": tx_hash,
-    }));
-    Ok(())
+    }))
 }
 
 /// Dispute an audit result.
 // checks: private key configured
 // effects: sends disputeAudit tx on-chain
 // returns: structured JSON with tx hash
-async fn execute_dispute(audit_id: u64, format: &Format) -> Result<()> {
+pub async fn execute_dispute(audit_id: u64) -> Result<serde_json::Value> {
     let _key = crate::config::get_private_key()
         .context("Wallet required for dispute. Set PORA_PRIVATE_KEY")?;
     let cfg = config::load_config();
@@ -535,11 +530,10 @@ async fn execute_dispute(audit_id: u64, format: &Format) -> Result<()> {
     let (tx_hash, _receipt) = tx::send_and_confirm(&cfg.contract, 0, data, 200_000)
         .await
         .context("disputeAudit transaction failed")?;
-    output::print_success(format, "request.dispute", &serde_json::json!({
+    Ok(serde_json::json!({
         "audit_id": audit_id,
         "tx": tx_hash,
-    }));
-    Ok(())
+    }))
 }
 
 /// Stream audit events for a bounty as NDJSON.
@@ -618,7 +612,7 @@ async fn execute_watch(bounty_id: u64, interval: u64, once: bool) -> Result<()> 
 /// Download and decrypt audit results.
 // SECURITY: private key never leaves local machine. Decryption happens client-side only.
 // TRUST: on-chain hashes are integrity anchors. If gateway tampers with ciphertext, hash check fails.
-async fn execute_results(audit_id: u64, key: Option<String>, raw: bool, format: &Format) -> Result<()> {
+pub async fn execute_results(audit_id: u64, key: Option<String>, raw: bool) -> Result<serde_json::Value> {
     let cfg = config::load_config();
     let gateway_url = cfg.gateway_url.as_deref()
         .context("gateway_url not set in config")?;
@@ -688,18 +682,17 @@ async fn execute_results(audit_id: u64, key: Option<String>, raw: bool, format: 
     }
 
     // Step 9: Output
-    if raw {
-        print!("{}", String::from_utf8_lossy(&plaintext));
+    let report: serde_json::Value = if raw {
+        serde_json::json!({"raw": String::from_utf8_lossy(&plaintext)})
     } else {
-        let report: serde_json::Value = serde_json::from_slice(&plaintext)
-            .unwrap_or(serde_json::json!({"raw": String::from_utf8_lossy(&plaintext)}));
-        output::print_success(format, "request.results", &serde_json::json!({
-            "audit_id": audit_id,
-            "bounty_id": bounty_id,
-            "report": report,
-        }));
-    }
-    Ok(())
+        serde_json::from_slice(&plaintext)
+            .unwrap_or(serde_json::json!({"raw": String::from_utf8_lossy(&plaintext)}))
+    };
+    Ok(serde_json::json!({
+        "audit_id": audit_id,
+        "bounty_id": bounty_id,
+        "report": report,
+    }))
 }
 
 #[cfg(test)]
@@ -770,6 +763,73 @@ mod tests {
     }
 }
 
+/// List bounties on the market.
+// checks: RPC reachable
+// effects: none (read-only)
+// returns: bounty array with count
+pub async fn execute_list(all: bool) -> Result<serde_json::Value> {
+    let bounties = contract::list_bounties(!all).await?;
+    Ok(serde_json::json!({
+        "bounties": bounties,
+        "count": bounties.len(),
+    }))
+}
+
+/// Get recent events for a bounty (snapshot of watch --once).
+// checks: bounty_id is valid, RPC reachable
+// effects: none (read-only)
+// returns: collected events as JSON array
+pub async fn execute_events(bounty_id: u64) -> Result<serde_json::Value> {
+    let cfg = config::load_config();
+    let rpc = crate::rpc::RpcClient::new(&cfg.rpc_url);
+    let bounty_id_hex = format!("0x{:064x}", bounty_id);
+
+    const LOOKBACK: u64 = 50_000;
+    let current = rpc.eth_block_number().await?;
+    let from_block = current.saturating_sub(LOOKBACK);
+
+    let mut events: Vec<serde_json::Value> = Vec::new();
+
+    // Events indexed by bountyId in topic[1]
+    for (topic0, event_name) in abi::bounty_event_topics() {
+        if let Ok(logs) = rpc.eth_get_logs_chunked(
+            &cfg.contract, &[Some(topic0), Some(&bounty_id_hex)],
+            from_block, current,
+        ).await {
+            for log in logs {
+                events.push(serde_json::json!({
+                    "event": event_name,
+                    "log": log,
+                }));
+            }
+        }
+    }
+
+    // Events indexed by bountyId in topic[2]
+    for (topic0, event_name) in abi::audit_event_topics_by_bounty() {
+        if let Ok(logs) = rpc.eth_get_logs_chunked(
+            &cfg.contract, &[Some(topic0), None, Some(&bounty_id_hex)],
+            from_block, current,
+        ).await {
+            for log in logs {
+                events.push(serde_json::json!({
+                    "event": event_name,
+                    "log": log,
+                }));
+            }
+        }
+    }
+
+    let count = events.len();
+    Ok(serde_json::json!({
+        "bounty_id": bounty_id,
+        "events": events,
+        "count": count,
+        "from_block": from_block,
+        "to_block": current,
+    }))
+}
+
 pub async fn run(action: RequestAction, format: &Format) -> Result<()> {
     match action {
         RequestAction::Submit {
@@ -784,7 +844,7 @@ pub async fn run(action: RequestAction, format: &Format) -> Result<()> {
             access,
             token,
         } => {
-            execute_submit(
+            let data = execute_submit(
                 &repo,
                 amount,
                 &trigger,
@@ -795,35 +855,33 @@ pub async fn run(action: RequestAction, format: &Format) -> Result<()> {
                 period_days,
                 &access,
                 &token,
-                format,
             )
             .await?;
+            output::print_success(format, "request.submit", &data);
         }
         RequestAction::Cancel { bounty_id } => {
-            execute_cancel(bounty_id, format).await?;
+            let data = execute_cancel(bounty_id).await?;
+            output::print_success(format, "request.cancel", &data);
         }
         RequestAction::TopUp { bounty_id, amount } => {
-            execute_topup(bounty_id, amount, format).await?;
+            let data = execute_topup(bounty_id, amount).await?;
+            output::print_success(format, "request.topup", &data);
         }
         RequestAction::List { all } => {
-            let bounties = contract::list_bounties(!all).await?;
-            output::print_success(
-                format,
-                "request.list",
-                &serde_json::json!({
-                    "bounties": bounties,
-                    "count": bounties.len(),
-                }),
-            );
+            let data = execute_list(all).await?;
+            output::print_success(format, "request.list", &data);
         }
         RequestAction::Watch { bounty_id, interval, once } => {
+            // WHY: streaming command outputs directly to stdout as NDJSON
             execute_watch(bounty_id, interval, once).await?;
         }
         RequestAction::Results { audit_id, key, raw } => {
-            execute_results(audit_id, key, raw, format).await?;
+            let data = execute_results(audit_id, key, raw).await?;
+            output::print_success(format, "request.results", &data);
         }
         RequestAction::Dispute { audit_id } => {
-            execute_dispute(audit_id, format).await?;
+            let data = execute_dispute(audit_id).await?;
+            output::print_success(format, "request.dispute", &data);
         }
     }
     Ok(())

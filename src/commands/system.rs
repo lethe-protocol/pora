@@ -19,70 +19,87 @@ pub enum SystemAction {
     },
 }
 
+// checks: none (reads config and network state)
+// effects: none (read-only)
+// returns: structured health check data
+pub async fn execute_doctor() -> Result<serde_json::Value> {
+    let config_dir = config::config_dir();
+    let cfg = config::load_config();
+
+    let market = contract::get_market_status().await;
+    let wallet = config::get_private_key().ok();
+
+    Ok(serde_json::json!({
+        "checks": {
+            "config_dir": {
+                "path": config_dir.to_string_lossy(),
+                "exists": config_dir.exists(),
+            },
+            "wallet": {
+                "status": if wallet.is_some() { "configured" } else { "missing" },
+                "action": if wallet.is_some() { "none" } else { "Set PORA_PRIVATE_KEY env var" },
+            },
+            "network": {
+                "rpc": cfg.rpc_url,
+                "contract": cfg.contract,
+                "status": if market.is_ok() { "connected" } else { "unreachable" },
+                "bounties": market.as_ref().map(|m| m.bounty_count).unwrap_or(0),
+                "audits": market.as_ref().map(|m| m.audit_count).unwrap_or(0),
+            },
+            "performer_config": {
+                "status": if config_dir.join("performer.json").exists() { "configured" } else { "not_configured" },
+            },
+            "keys": {
+                "status": if crate::crypto::delivery_keys_exist() { "ok" } else { "missing" },
+                "path": config::keys_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+                "action": if crate::crypto::delivery_keys_exist() { "none" } else { "Run 'pora system keygen' or keys will auto-generate on first submit" },
+            },
+        }
+    }))
+}
+
+// checks: private key configured
+// effects: none (read-only RPC call)
+// returns: wallet address, network, balance
+pub async fn execute_whoami() -> Result<serde_json::Value> {
+    let key = config::get_private_key()?;
+    let wallet = contract::get_wallet_info(&key).await?;
+    Ok(serde_json::to_value(&wallet)?)
+}
+
+// checks: keys don't exist (unless force)
+// effects: generates X25519 keypair to ~/.pora/keys/
+// returns: key paths and public key hex
+pub fn execute_keygen(force: bool) -> Result<serde_json::Value> {
+    use crate::crypto;
+    if crypto::delivery_keys_exist() && !force {
+        anyhow::bail!(
+            "Keys already exist at ~/.pora/keys/. Use --force to regenerate."
+        );
+    }
+    let (priv_path, pub_path) = crypto::generate_x25519_keypair()?;
+    let pubkey_hex = std::fs::read_to_string(&pub_path)?;
+    Ok(serde_json::json!({
+        "private_key": priv_path.to_string_lossy(),
+        "public_key": pub_path.to_string_lossy(),
+        "pubkey_hex": pubkey_hex.trim(),
+        "message": "X25519 delivery keypair generated. BACK UP ~/.pora/keys/delivery.key — it is required to decrypt audit results."
+    }))
+}
+
 pub async fn run(action: SystemAction, format: &Format) -> Result<()> {
     match action {
         SystemAction::Doctor => {
-            let config_dir = config::config_dir();
-            let cfg = config::load_config();
-
-            let market = contract::get_market_status().await;
-            let wallet = config::get_private_key()
-                .ok()
-                .and_then(|k| {
-                    // Try to get wallet info synchronously is tricky, check key validity
-                    Some(k)
-                });
-
-            let info = serde_json::json!({
-                "checks": {
-                    "config_dir": {
-                        "path": config_dir.to_string_lossy(),
-                        "exists": config_dir.exists(),
-                    },
-                    "wallet": {
-                        "status": if wallet.is_some() { "configured" } else { "missing" },
-                        "action": if wallet.is_some() { "none" } else { "Set PORA_PRIVATE_KEY env var" },
-                    },
-                    "network": {
-                        "rpc": cfg.rpc_url,
-                        "contract": cfg.contract,
-                        "status": if market.is_ok() { "connected" } else { "unreachable" },
-                        "bounties": market.as_ref().map(|m| m.bounty_count).unwrap_or(0),
-                        "audits": market.as_ref().map(|m| m.audit_count).unwrap_or(0),
-                    },
-                    "performer_config": {
-                        "status": if config_dir.join("performer.json").exists() { "configured" } else { "not_configured" },
-                    },
-                    "keys": {
-                        "status": if crate::crypto::delivery_keys_exist() { "ok" } else { "missing" },
-                        "path": config::keys_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
-                        "action": if crate::crypto::delivery_keys_exist() { "none" } else { "Run 'pora system keygen' or keys will auto-generate on first submit" },
-                    },
-                }
-            });
-            output::print_success(format, "system.doctor", &info);
+            let data = execute_doctor().await?;
+            output::print_success(format, "system.doctor", &data);
         }
         SystemAction::Whoami => {
-            let key = config::get_private_key()?;
-            let wallet = contract::get_wallet_info(&key).await?;
-            output::print_success(format, "system.whoami", &wallet);
+            let data = execute_whoami().await?;
+            output::print_success(format, "system.whoami", &data);
         }
         SystemAction::Keygen { force } => {
-            use crate::crypto;
-            if crypto::delivery_keys_exist() && !force {
-                anyhow::bail!(
-                    "Keys already exist at ~/.pora/keys/. Use --force to regenerate."
-                );
-            }
-            let (priv_path, pub_path) = crypto::generate_x25519_keypair()?;
-            let pubkey_hex = std::fs::read_to_string(&pub_path)?;
-            let info = serde_json::json!({
-                "private_key": priv_path.to_string_lossy(),
-                "public_key": pub_path.to_string_lossy(),
-                "pubkey_hex": pubkey_hex.trim(),
-                "message": "X25519 delivery keypair generated. BACK UP ~/.pora/keys/delivery.key — it is required to decrypt audit results."
-            });
-            output::print_success(format, "system.keygen", &info);
+            let data = execute_keygen(force)?;
+            output::print_success(format, "system.keygen", &data);
         }
     }
     Ok(())
