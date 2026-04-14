@@ -1,2 +1,21 @@
 /target
+
+# Environment & Secrets
+.env
+.env.*
+*.key
+*.pem
+*.secret
+*.token
+.pora/
+
+# AI tooling state
 .omx/
+.omc/
+.claude/
+.mcp.json
+.codex
+
+# OS
+.DS_Store
+Thumbs.db
