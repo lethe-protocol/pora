@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Security audit market CLI. The passage where code enters, findings emerge, and vulnerability knowledge is destroyed."
 license = "MIT"
-repository = "https://github.com/lethe-protocol/pora"
+repository = "https://github.com/heliopora/pora-cli"
 
 [[bin]]
 name = "pora"

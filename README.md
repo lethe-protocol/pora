@@ -84,8 +84,8 @@ pora/
 
 ## Links
 
-- [lethe-market](https://github.com/lethe-protocol/lethe-market) — Protocol contracts + ROFL TEE worker
-- [lethe-protocol.github.io](https://lethe-protocol.github.io) — Landing page
+- [pora-market](https://github.com/heliopora/pora-market) — Protocol contracts + ROFL TEE worker
+- [heliopora.github.io](https://heliopora.github.io) — Landing page
 
 ## License
 
